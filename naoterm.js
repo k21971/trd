@@ -20,7 +20,6 @@ function show_debug_info()
     }
 }
 
-
 function debugobj(obj)
 {
     if (!show_debugging_info) return;
@@ -45,18 +44,15 @@ function toggle_debug()
     if (x) x.style.fontWeight=(show_debugging_info ? 'bold' : 'normal');
 }
 
-
 function is_array(input){
     return typeof(input)=='object'&&(input instanceof Array);
 }
-
 
 /*
  naoterm, by paxed@alt.org
  a javascript vt100 (or thereabouts) terminal emulation,
  mainly meant for replaying nethack TTYRECs.
 */
-
 
 function naoterm(params)
 {
@@ -72,6 +68,8 @@ function naoterm(params)
   this.OSC_color_change = 1;
   this.colordefs_init = 0;
   this.colordefs = { };
+  this.truecolor_idx = { };
+  this.next_truecolor = 256;
 
   this.cursor_x = 0;
   this.cursor_y = 0;
@@ -102,8 +100,8 @@ function naoterm(params)
   this.use_alt_charset = 0;
   this.had_clrscr = 0;
   this.utf8 = 0;
+  this.utf8_pending = ''; /* trailing bytes of a utf8 sequence split across frames */
   this.last_printed_char = '';
-
 
     for (var i in params) {
         if (i == "wid") {
@@ -212,7 +210,6 @@ function naoterm(params)
 		       't' : '&#x251c;',
 
 		       'n' : '&#x253c;'}; /* crosswall */
-
 
   this.get_idx = function(x,y) { return y*(this.SCREEN_WID+1) + x; }
 
@@ -430,7 +427,6 @@ function naoterm(params)
 	  return sret;
       }
 
-
   this.clrcell = function(x,y)
       {
 	  delete this.screen[this.get_idx(x,y)];
@@ -455,7 +451,7 @@ function naoterm(params)
                       "cursor_x", "cursor_y", "saved_cursor_x", "saved_cursor_y",
                       "saved_attr", "saved_color", "saved_bgcolor", "attr", "color",
                       "bgcolor", "def_color", "def_bgcolor", "hi_x", "hi_y",
-                      "use_alt_charset", "had_clrscr", "utf8" ];
+                      "use_alt_charset", "had_clrscr", "utf8", "utf8_pending" ];
 
         for (var i = 0; i < fields.length; i++) {
             ret[fields[i]] = this[fields[i]];
@@ -476,7 +472,7 @@ function naoterm(params)
                       "cursor_x", "cursor_y", "saved_cursor_x", "saved_cursor_y",
                       "saved_attr", "saved_color", "saved_bgcolor", "attr", "color",
                       "bgcolor", "def_color", "def_bgcolor", "hi_x", "hi_y",
-                      "use_alt_charset", "had_clrscr", "utf8" ];
+                      "use_alt_charset", "had_clrscr", "utf8", "utf8_pending" ];
 
         for (var i = 0; i < fields.length; i++) {
             this[fields[i]] = data[fields[i]];
@@ -538,7 +534,7 @@ function naoterm(params)
 	      } else {
 		  if (this.use_alt_charset && (this.deccharset[chr] != undefined)) {
 		      c = this.deccharset[chr];
-		  } else if (this.ibmcharset[o.toString()] != undefined) {
+		  } else if (!this.utf8 && this.ibmcharset[o.toString()] != undefined) {
 		      c = this.ibmcharset[o.toString()];
 		  } else {
 		      c = chr;
@@ -577,7 +573,6 @@ function naoterm(params)
 	  if (this.hi_y <= this.cursor_y) this.hi_y = this.cursor_y+1;
       }
 
-
   this.putstr = function(str)
       {
 	  for (var i = 0; i < str.length; i++) {
@@ -610,6 +605,80 @@ function naoterm(params)
             this.scroll_screen(1);
             this.cursor_y--;
         }
+    }
+
+    /* xterm 256-color palette index (16-255) to an [r,g,b] triplet (0-255) */
+    this.xterm256_rgb = function(n)
+    {
+        if (n >= 16 && n <= 231) {
+            n -= 16;
+            var lvl = [0, 95, 135, 175, 215, 255];
+            return [ lvl[Math.floor(n / 36) % 6], lvl[Math.floor(n / 6) % 6], lvl[n % 6] ];
+        }
+        if (n >= 232 && n <= 255) {
+            var v = 8 + (n - 232) * 10;
+            return [v, v, v];
+        }
+        return null;
+    }
+
+    /* format an 8-bit rgb triplet as an X11 "rgb:RRRR/GGGG/BBBB" string;
+       normalize_colordef()/change_color() turn this into valid CSS */
+    this.x11_color = function(r, g, b)
+    {
+        function h(v) {
+            v = Math.max(0, Math.min(255, v | 0));
+            var t = v.toString(16);
+            if (t.length < 2) t = "0" + t;
+            return t + t;
+        }
+        return "rgb:" + h(r) + "/" + h(g) + "/" + h(b);
+    }
+
+    /* register a 24-bit color once and return the color index assigned to it */
+    this.ensure_rgb_color = function(r, g, b)
+    {
+        var key = this.x11_color(r, g, b);
+        if (this.truecolor_idx[key] == undefined) {
+            this.truecolor_idx[key] = this.next_truecolor++;
+            this.change_color(this.truecolor_idx[key], key);
+        }
+        return this.truecolor_idx[key];
+    }
+
+    /* CSI 38/48 extended color: ;5;n (256-color) or ;2;r;g;b (24-bit truecolor).
+       sets fg (is_bg=false) or bg, registering CSS as needed.
+       returns the number of extra SGR params consumed, or 0 if unhandled. */
+    this.handle_sgr_color = function(is_bg, attr, i)
+    {
+        var mode = parseInt(attr[i + 1]);
+        if (mode == 5) {
+            if (i + 2 >= attr.length) return 0;
+            var n = parseInt(attr[i + 2]);
+            if (isNaN(n)) return 0;
+            this.get_css_colordefs();
+            if (this.colordefs[n] == undefined && n >= 16 && n <= 255) {
+                var rgb = this.xterm256_rgb(n);
+                if (rgb) this.change_color(n, this.x11_color(rgb[0], rgb[1], rgb[2]));
+            }
+            if (this.colordefs[n] != undefined) {
+                if (is_bg) this.bgcolor = n; else this.color = n;
+            } else if (n >= 0 && n <= 15) {
+                if (is_bg) { this.bgcolor = n % 8; if (n >= 8) this.attr |= 1; }
+                else { this.color = n % 8; if (n >= 8) this.attr |= 1; else this.attr &= ~1; }
+            } else {
+                return 0;
+            }
+            return 2;
+        } else if (mode == 2) {
+            if (i + 4 >= attr.length) return 0;
+            var r = parseInt(attr[i + 2]), g = parseInt(attr[i + 3]), b = parseInt(attr[i + 4]);
+            if (isNaN(r) || isNaN(g) || isNaN(b)) return 0;
+            var idx = this.ensure_rgb_color(r, g, b);
+            if (is_bg) this.bgcolor = idx; else this.color = idx;
+            return 4;
+        }
+        return 0;
     }
 
   this.setattr = function(attr)
@@ -649,53 +718,17 @@ function naoterm(params)
                       unhandled = 1;
                   }
 	      } else if ((a >= 30) && (a <= 37)) this.color = a-30;
-              else if (a == 38) {
-                  /* Set fg color: CSI 38 ; 5 ; <color_index> m */
-                  if (tmpidx+2 < attr.length && attr[tmpidx+1] == 5) {
-                      var clr = parseInt(attr[tmpidx+2]);
-                      this.get_css_colordefs();
-                      if (this.colordefs[clr] || (clr >= 0 && clr <= 16)) {
-                          if (!this.colordefs[clr]) {
-                              this.color = clr % 8;
-                              if (clr >= 8)
-                                  this.attr |= 1;
-                              else
-                                  this.attr &= ~1;
-                          } else {
-                              this.color = clr;
-                          }
-                      } else {
-                          debugwrite("<b>Trying to set color to "+clr+"</b>");
-                      }
-                      break;
-                  } else {
-                      unhandled = 1;
-                  }
+                            else if (a == 38) {
+                  /* CSI 38;5;n (256-color) or 38;2;r;g;b (24-bit) foreground */
+                  var used = this.handle_sgr_color(false, attr, tmpidx);
+                  if (used > 0) tmpidx += used; else unhandled = 1;
               }
               else if (a == 39) { this.color = this.def_color; this.attr &= ~1; }
 	      else if ((a >= 40) && (a <= 47)) this.bgcolor = a-40;
-              else if (a == 48) {
-                  /* Set bg color: CSI 48 ; 5 ; <color_index> m */
-                  if (tmpidx+2 < attr.length && attr[tmpidx+1] == 5) {
-                      var clr = parseInt(attr[tmpidx+2]);
-                      this.get_css_colordefs();
-                      if (this.colordefs[clr] || (clr >= 0 && clr <= 16)) {
-                          if (!this.colordefs[clr]) {
-                              this.bgcolor = clr % 8;
-                              if (clr >= 8)
-                                  this.attr |= 1;
-                              //else
-                              //    this.attr &= ~1;
-                          } else {
-                              this.bgcolor = clr;
-                          }
-                      } else {
-                          debugwrite("<b>Trying to set bgcolor to "+clr+"</b>");
-                      }
-                      break;
-                  } else {
-                      unhandled = 1;
-                  }
+                            else if (a == 48) {
+                  /* CSI 48;5;n (256-color) or 48;2;r;g;b (24-bit) background */
+                  var used = this.handle_sgr_color(true, attr, tmpidx);
+                  if (used > 0) tmpidx += used; else unhandled = 1;
               }
               else if (a == 49) { this.bgcolor = this.def_bgcolor; }
               else if ((a >= 90) && (a <= 97)) { this.color = a-90; this.attr |= 1; }
@@ -718,6 +751,7 @@ function naoterm(params)
       var cell = this.get_data(x,y);
       if (cell != undefined) {
 	  style = (cell['color'] + ((cell['attr'] & 1) * 8));
+	  if (style < 0 || style > 15) style = 7; /* extended colors: lightgray fallback in wiki */
       }
       return colornames[style];
   }
@@ -784,12 +818,14 @@ function naoterm(params)
 	      }
 	      if (bg != undefined && bg != this.def_bgcolor)
 		  style += ' b'+bg;
-	      if (fg != undefined && (fg + bright*8) != this.def_color)
-		  style += ' f'+(fg + bright*8);
+	      if (fg != undefined) {
+		  var fgidx = (fg < 8) ? (fg + bright*8) : fg;
+		  if (fgidx != this.def_color)
+		      style += ' f'+fgidx;
+	      }
 	  }
 	  return style;
       }
-
 
   this.getcellspan = function(x,y,maxx)
       {
@@ -817,7 +853,6 @@ function naoterm(params)
 	  ret['x'] = x;
 	  return ret;
       }
-
 
   this.switch_charset = function(code, param)
       {
@@ -1009,6 +1044,25 @@ function naoterm(params)
 	}
 
 	throw Error('Invalid UTF-8 detected');
+    }
+
+    /* number of trailing bytes that form a utf8 sequence truncated by a frame
+       boundary, so writestr can carry them over to the next frame's input */
+    this.utf8_incomplete_tail = function(str)
+    {
+        var n = str.length;
+        for (var back = 1; back <= 3 && back <= n; back++) {
+            var c = str.charCodeAt(n - back) & 0xFF;
+            if (c < 0x80) return 0;             /* ascii: prior bytes are complete */
+            if ((c & 0xC0) == 0x80) continue;   /* continuation byte, look back further */
+            var need;
+            if (c >= 0xC2 && c <= 0xDF) need = 2;
+            else if (c >= 0xE0 && c <= 0xEF) need = 3;
+            else if (c >= 0xF0 && c <= 0xF4) need = 4;
+            else return 0;                      /* invalid lead, let the decoder handle it */
+            return (back < need) ? back : 0;
+        }
+        return 0;
     }
 
     /* taken from https://github.com/mathiasbynens/utf8.js/ */
@@ -1286,9 +1340,12 @@ function naoterm(params)
 	  }
       }
 
-
   this.writestr = function(datastr)
       {
+          if (this.utf8 && this.utf8_pending != '') {
+              datastr = this.utf8_pending + datastr;
+              this.utf8_pending = '';
+          }
           this.input = this.input.concat(datastr.split(""));
           this.failed_input = 0;
 	  this.had_clrscr = 0;
@@ -1302,8 +1359,9 @@ function naoterm(params)
                   break;
               } else if (inp == '\033') {
 		  if (wrotestr.length > 0) {
-                      if (this.utf8)
-                          wrotestr = this.utf8decode(wrotestr);
+                      if (this.utf8) {
+                          try { wrotestr = this.utf8decode(wrotestr); } catch (e) { }
+                      }
                       this.putstr(wrotestr);
                       debugwrite("wrote '<tt style='background-color:#eee;'>"+wrotestr.toDebugString()+"</tt>'");
                       wrotestr = '';
@@ -1404,8 +1462,15 @@ function naoterm(params)
 	      }
 	  }
 	  if (wrotestr.length > 0) {
-              if (this.utf8)
-                  wrotestr = this.utf8decode(wrotestr);
+              if (this.utf8) {
+                  /* hold back a sequence truncated by the frame boundary */
+                  var tail = this.utf8_incomplete_tail(wrotestr);
+                  if (tail > 0) {
+                      this.utf8_pending = wrotestr.slice(wrotestr.length - tail);
+                      wrotestr = wrotestr.slice(0, wrotestr.length - tail);
+                  }
+                  try { wrotestr = this.utf8decode(wrotestr); } catch (e) { }
+              }
               this.putstr(wrotestr);
               debugwrite("wrote '<tt style='background-color:#eee;'>"+wrotestr.toDebugString()+"</tt>'");
               wrotestr = '';
@@ -1415,6 +1480,4 @@ function naoterm(params)
       }
 
 }
-
-
 

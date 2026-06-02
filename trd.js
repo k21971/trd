@@ -119,7 +119,6 @@ function create_ui()
         btn.innerHTML = '<button type="button" onclick="download_screen_png();" id="download_png_button">download png</button>';
     }
 
-
     btn = $("btn_rnd_ttyrec");
     if (btn) {
         btn.innerHTML = '<button type="button" onclick="window.location.search=\'\';" id="rnd_ttyrec_button">&#x1f500;</button>';
@@ -519,7 +518,6 @@ function show_screen_html()
     }
 }
 
-
 function load_random_ttyrec()
 {
 	toggle_pause_playback(1);
@@ -626,6 +624,43 @@ function parse_ttyrec(data)
     return frames;
 }
 
+/* Decide whether a terminal byte stream is UTF-8. NetHack's utf8graphics symset
+   emits raw UTF-8 without the "ESC % G" designator naoterm watches for, so we sniff
+   the bytes: UTF-8 only if every high byte is part of a valid multibyte sequence and
+   at least one such sequence exists. Legacy IBMgraphics (raw CP437 high bytes) fails
+   this and keeps the old single-byte rendering path. */
+function detect_utf8(str)
+{
+    var n = str.length;
+    var i = 0;
+    var seen_multibyte = 0;
+    while (i < n) {
+        var c = str.charCodeAt(i) & 0xFF;
+        if (c < 0x80) { i++; continue; }
+        var need;
+        if (c >= 0xC2 && c <= 0xDF) need = 1;
+        else if (c >= 0xE0 && c <= 0xEF) need = 2;
+        else if (c >= 0xF0 && c <= 0xF4) need = 3;
+        else return false; /* lone continuation byte or invalid/overlong lead */
+        for (var j = 1; j <= need; j++) {
+            if (i + j >= n) return (seen_multibyte > 0); /* truncated tail; trust the sample */
+            if ((str.charCodeAt(i + j) & 0xC0) != 0x80) return false;
+        }
+        seen_multibyte++;
+        i += need + 1;
+    }
+    return (seen_multibyte > 0);
+}
+
+/* Sniff a sample of the frame data (headers excluded) to choose UTF-8 vs legacy. */
+function detect_ttyrec_utf8(frames)
+{
+    var sample = '';
+    for (var i = 0; i < frames.length && sample.length < 524288; i++)
+        sample += frames[i].data;
+    return detect_utf8(sample) ? 1 : 0;
+}
+
 function loading_ttyrec()
 {
     if (req.readyState == 4) { // Complete
@@ -640,6 +675,9 @@ function loading_ttyrec()
                 last_cached_frame = 0;
                 n_cached_frames = 0;
                 ttyrec_frames = parse_ttyrec(unescape(req.responseText));
+                naoterm_params.utf8 = detect_ttyrec_utf8(ttyrec_frames);
+                naoterminal.utf8 = naoterm_params.utf8;
+                naoterminal.utf8_pending = '';
                 toggle_debug(DEBUG_INFO);
                 toggle_pause_playback(PAUSE_INITIAL);
                 show_current_frame();
