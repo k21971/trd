@@ -678,6 +678,7 @@ function loading_ttyrec()
                 naoterm_params.utf8 = detect_ttyrec_utf8(ttyrec_frames);
                 naoterminal.utf8 = naoterm_params.utf8;
                 naoterminal.utf8_pending = '';
+                naoterminal.prune_extended_colors();
                 toggle_debug(DEBUG_INFO);
                 toggle_pause_playback(PAUSE_INITIAL);
                 show_current_frame();

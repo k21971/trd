@@ -70,6 +70,7 @@ function naoterm(params)
   this.colordefs = { };
   this.truecolor_idx = { };
   this.next_truecolor = 256;
+  this.max_truecolors = 1024; /* cap distinct 24-bit colors registered as live CSS */
 
   this.cursor_x = 0;
   this.cursor_y = 0;
@@ -635,11 +636,50 @@ function naoterm(params)
         return "rgb:" + h(r) + "/" + h(g) + "/" + h(b);
     }
 
-    /* register a 24-bit color once and return the color index assigned to it */
+    /* nearest xterm 256-color palette index (16-255) to an [r,g,b] triplet, used as
+       a bounded fallback once max_truecolors distinct 24-bit colors are registered.
+       Picks the closer of the 6x6x6 color cube and the 24-step grayscale ramp. O(1). */
+    this.rgb_to_xterm256 = function(r, g, b)
+    {
+        var lvl = [0, 95, 135, 175, 215, 255];
+        function nearest_lvl(v) {
+            var best = 0, bestd = 256;
+            for (var k = 0; k < 6; k++) {
+                var d = Math.abs(v - lvl[k]);
+                if (d < bestd) { bestd = d; best = k; }
+            }
+            return best;
+        }
+        var cube = 16 + 36 * nearest_lvl(r) + 6 * nearest_lvl(g) + nearest_lvl(b);
+        /* grayscale ramp (232-255): level value v = 8 + (n-232)*10 */
+        var gn = Math.round(((r + g + b) / 3 - 8) / 10);
+        if (gn < 0) gn = 0; else if (gn > 23) gn = 23;
+        var grayidx = 232 + gn;
+        var that = this;
+        function dist2(idx) {
+            var c = that.xterm256_rgb(idx);
+            if (!c) return 1e9;
+            return (r-c[0])*(r-c[0]) + (g-c[1])*(g-c[1]) + (b-c[2])*(b-c[2]);
+        }
+        return (dist2(grayidx) < dist2(cube)) ? grayidx : cube;
+    }
+
+    /* register a 24-bit color once and return the color index assigned to it. Past
+       max_truecolors distinct colors, quantize to the bounded 256-color palette
+       instead of growing the stylesheet without limit. */
     this.ensure_rgb_color = function(r, g, b)
     {
         var key = this.x11_color(r, g, b);
         if (this.truecolor_idx[key] == undefined) {
+            if (this.next_truecolor - 256 >= this.max_truecolors) {
+                var n = this.rgb_to_xterm256(r, g, b);
+                this.get_css_colordefs();
+                if (this.colordefs[n] == undefined) {
+                    var rgb = this.xterm256_rgb(n);
+                    if (rgb) this.change_color(n, this.x11_color(rgb[0], rgb[1], rgb[2]));
+                }
+                return n;
+            }
             this.truecolor_idx[key] = this.next_truecolor++;
             this.change_color(this.truecolor_idx[key], key);
         }
@@ -718,21 +758,21 @@ function naoterm(params)
                       unhandled = 1;
                   }
 	      } else if ((a >= 30) && (a <= 37)) this.color = a-30;
-                            else if (a == 38) {
+              else if (a == 38) {
                   /* CSI 38;5;n (256-color) or 38;2;r;g;b (24-bit) foreground */
                   var used = this.handle_sgr_color(false, attr, tmpidx);
                   if (used > 0) tmpidx += used; else unhandled = 1;
               }
               else if (a == 39) { this.color = this.def_color; this.attr &= ~1; }
 	      else if ((a >= 40) && (a <= 47)) this.bgcolor = a-40;
-                            else if (a == 48) {
+              else if (a == 48) {
                   /* CSI 48;5;n (256-color) or 48;2;r;g;b (24-bit) background */
                   var used = this.handle_sgr_color(true, attr, tmpidx);
                   if (used > 0) tmpidx += used; else unhandled = 1;
               }
               else if (a == 49) { this.bgcolor = this.def_bgcolor; }
-              else if ((a >= 90) && (a <= 97)) { this.color = a-90; this.attr |= 1; }
-              else if ((a >= 100) && (a <= 107)) { this.bgcolor = a-100; this.attr |= 1; }
+              else if ((a >= 90) && (a <= 97)) { this.color = (a-90) + 8; } /* aixterm bright fg: select index 8-15 directly, not via the bold bit (which would leak onto a following 30-37 color) */
+              else if ((a >= 100) && (a <= 107)) { this.bgcolor = (a-100) + 8; } /* aixterm bright bg */
               else {
                   unhandled = 1;
               }
@@ -1065,6 +1105,20 @@ function naoterm(params)
         return 0;
     }
 
+    /* decode a run of accumulated bytes as utf8. A run ending in an incomplete
+       multibyte sequence either carries the partial to the next frame (save_tail,
+       at a frame boundary) or drops it (mid-frame, before an escape sequence). A
+       malformed run yields its raw bytes rather than throwing. */
+    this.flush_utf8 = function(wrotestr, save_tail)
+    {
+        var tail = this.utf8_incomplete_tail(wrotestr);
+        if (tail > 0) {
+            if (save_tail) this.utf8_pending = wrotestr.slice(wrotestr.length - tail);
+            wrotestr = wrotestr.slice(0, wrotestr.length - tail);
+        }
+        try { return this.utf8decode(wrotestr); } catch (e) { return wrotestr; }
+    }
+
     /* taken from https://github.com/mathiasbynens/utf8.js/ */
     this.utf8decode = function(byteString)
     {
@@ -1150,6 +1204,33 @@ function naoterm(params)
             }
             ruleidx++;
         }
+    }
+
+    /* drop on-the-fly truecolor registrations (index >= 256) from the live stylesheet
+       so a previously-loaded ttyrec's 24-bit colors don't linger across loads. The
+       fixed 0-255 palette is deterministic and left intact. */
+    this.prune_extended_colors = function()
+    {
+        this.truecolor_idx = { };
+        this.next_truecolor = 256;
+        var sheet = document.styleSheets[0];
+        for (var i = sheet.cssRules.length - 1; i >= 0; i--) {
+            var t = sheet.cssRules[i].cssText;
+            var m = t.match(/\.[fb]([0-9]+)\s*\{/);
+            if (m && parseInt(m[1]) >= 256) {
+                sheet.deleteRule(i);
+            } else if (t.match(/^:root/)) {
+                var str = t.replace(/--color([0-9]+): *[^;]+;\s*/g, function(whole, num) {
+                    return (parseInt(num) >= 256) ? "" : whole;
+                });
+                if (str != t) {
+                    sheet.deleteRule(i);
+                    sheet.insertRule(str, i);
+                }
+            }
+        }
+        this.colordefs = { };
+        this.colordefs_init = 0;
     }
 
     this.handle_OSC = function(param)
@@ -1359,9 +1440,8 @@ function naoterm(params)
                   break;
               } else if (inp == '\033') {
 		  if (wrotestr.length > 0) {
-                      if (this.utf8) {
-                          try { wrotestr = this.utf8decode(wrotestr); } catch (e) { }
-                      }
+                      if (this.utf8)
+                          wrotestr = this.flush_utf8(wrotestr, false);
                       this.putstr(wrotestr);
                       debugwrite("wrote '<tt style='background-color:#eee;'>"+wrotestr.toDebugString()+"</tt>'");
                       wrotestr = '';
@@ -1462,15 +1542,8 @@ function naoterm(params)
 	      }
 	  }
 	  if (wrotestr.length > 0) {
-              if (this.utf8) {
-                  /* hold back a sequence truncated by the frame boundary */
-                  var tail = this.utf8_incomplete_tail(wrotestr);
-                  if (tail > 0) {
-                      this.utf8_pending = wrotestr.slice(wrotestr.length - tail);
-                      wrotestr = wrotestr.slice(0, wrotestr.length - tail);
-                  }
-                  try { wrotestr = this.utf8decode(wrotestr); } catch (e) { }
-              }
+              if (this.utf8)
+                  wrotestr = this.flush_utf8(wrotestr, true);
               this.putstr(wrotestr);
               debugwrite("wrote '<tt style='background-color:#eee;'>"+wrotestr.toDebugString()+"</tt>'");
               wrotestr = '';
