@@ -332,15 +332,38 @@ function goto_first_frame()
 function goto_last_frame()
 {
     toggle_pause_playback(1);
-    current_frame = ttyrec_frames.length - 1;
-    while (!ttyrec_frames[current_frame].clrscr
-           && current_frame > 0) {
-        current_frame--;
+    var target = ttyrec_frames.length - 1;
+    if (target < 0)
+        return;
+
+    /* The last frame is usually NOT a clrscr (e.g. a long end-of-game
+       sequence after the final screen-clear), so we cannot just stop at the
+       most recent clrscr -- that can leave us well short of the end. Instead
+       find the nearest safe restart point at or before the last frame (a
+       cached screen snapshot, or a clrscr the emulator can replay forward
+       from) and replay forward to the true last frame. */
+    var start = target;
+    while (start > 0
+           && ttyrec_frames[start].term == undefined
+           && !ttyrec_frames[start].clrscr) {
+        start--;
     }
+
     if (naoterminal) {
         delete naoterminal;
         naoterminal = undefined;
     }
+    naoterminal = new naoterm(naoterm_params);
+
+    if (ttyrec_frames[start].term) {
+        naoterminal.copyFrom(ttyrec_frames[start].term);
+        start++;
+    }
+    for (var i = start; i < target; i++) {
+        naoterminal.writestr(ttyrec_frames[i].data);
+    }
+
+    current_frame = target;
     show_current_frame();
 }
 
