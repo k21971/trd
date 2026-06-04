@@ -270,16 +270,65 @@ function update_cached_frames()
     }
 }
 
-/* find frame before current one which is cached or has a clrscr */
-function find_prev_cached()
+/* Render frame `target` exactly. The emulator is stateful and only moves
+   forward, so reach an arbitrary frame by rebuilding from the nearest restart
+   point and replaying forward.
+
+   The only safe restart point is a cached screen snapshot: copyFrom() restores
+   the full terminal state (size, charset, scroll, colors). A bare clrscr is
+   NOT safe -- ESC[2J clears the screen but leaves size/charset/scroll intact,
+   and the screen here grows on demand from cursor moves, so replaying from a
+   fresh terminal at a clrscr can reconstruct a different size than a true
+   replay from frame 0 (seen on resized-terminal ttyrecs). With no snapshot at
+   or before target we therefore replay from frame 0.
+
+   While replaying we leave the same sparse cache normal playback would -- a
+   small window just before the target, plus every CACHEFRAMES.every_nth frame
+   within the range update_cached_frames() would keep (the last
+   every_nth*max frames) -- so a subsequent step-back lands on the true
+   previous frame without another long replay, and without a transient cache
+   blow-up on a full from-0 replay. */
+function seek_to_frame(target)
 {
-    var ret = current_frame;
-    while (ret-- > 0) {
-        if (ttyrec_frames[ret].term != undefined
-            || ttyrec_frames[ret].clrscr)
-            break;
+    var last = ttyrec_frames.length - 1;
+    if (last < 0)
+        return;
+    if (target < 0) target = 0;
+    if (target > last) target = last;
+
+    if (ttyrec_frames[target].term == undefined) {
+        var start = target;
+        while (start > 0 && ttyrec_frames[start].term == undefined)
+            start--;
+
+        if (naoterminal) {
+            delete naoterminal;
+            naoterminal = undefined;
+        }
+        naoterminal = new naoterm(naoterm_params);
+
+        if (ttyrec_frames[start].term) {
+            naoterminal.copyFrom(ttyrec_frames[start].term);
+            start++;
+        }
+        var horizon = target - CACHEFRAMES.every_nth * CACHEFRAMES.max;
+        for (var i = start; i < target; i++) {
+            naoterminal.writestr(ttyrec_frames[i].data);
+            if (ENABLE_SCREEN_CACHE
+                && ttyrec_frames[i].term == undefined
+                && ((i > target - CACHEFRAMES.n_previous)
+                    || (((i % CACHEFRAMES.every_nth) == 0) && (i > horizon)))) {
+                ttyrec_frames[i].term = naoterminal.copy();
+                if (last_cached_frame < i)
+                    last_cached_frame = i;
+                n_cached_frames++;
+            }
+        }
     }
-    return ret;
+
+    current_frame = target;
+    show_current_frame();
+    update_cached_frames();
 }
 
 function show_next_frame()
@@ -295,11 +344,8 @@ function show_next_frame()
 function show_prev_frame()
 {
     toggle_pause_playback(1);
-    if (current_frame > 0) {
-        update_cached_frames();
-        current_frame = find_prev_cached();
-        show_current_frame();
-    }
+    if (current_frame > 0)
+        seek_to_frame(current_frame - 1);
 }
 
 function play_next_frame()
@@ -331,40 +377,12 @@ function goto_first_frame()
 
 function goto_last_frame()
 {
-    toggle_pause_playback(1);
-    var target = ttyrec_frames.length - 1;
-    if (target < 0)
-        return;
-
     /* The last frame is usually NOT a clrscr (e.g. a long end-of-game
-       sequence after the final screen-clear), so we cannot just stop at the
-       most recent clrscr -- that can leave us well short of the end. Instead
-       find the nearest safe restart point at or before the last frame (a
-       cached screen snapshot, or a clrscr the emulator can replay forward
-       from) and replay forward to the true last frame. */
-    var start = target;
-    while (start > 0
-           && ttyrec_frames[start].term == undefined
-           && !ttyrec_frames[start].clrscr) {
-        start--;
-    }
-
-    if (naoterminal) {
-        delete naoterminal;
-        naoterminal = undefined;
-    }
-    naoterminal = new naoterm(naoterm_params);
-
-    if (ttyrec_frames[start].term) {
-        naoterminal.copyFrom(ttyrec_frames[start].term);
-        start++;
-    }
-    for (var i = start; i < target; i++) {
-        naoterminal.writestr(ttyrec_frames[i].data);
-    }
-
-    current_frame = target;
-    show_current_frame();
+       sequence after the final screen-clear), so we can't just stop at the
+       most recent clrscr -- seek_to_frame() replays forward to the true
+       last frame. */
+    toggle_pause_playback(1);
+    seek_to_frame(ttyrec_frames.length - 1);
 }
 
 function toggle_pause_btn()
