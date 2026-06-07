@@ -27,25 +27,12 @@ function debugobj(obj)
     for (property in obj) {
 	output += property + ': ' + obj[property]+'; ';
     }
-    output = output.replaceAll('<','&lt;').replaceAll('&','&amp;');;
+    output = output.replaceAll('&','&amp;').replaceAll('<','&lt;');
     debugwrite('<b>' + output + '</b>');
 }
 
 String.prototype.toDebugString = function() {
-    return this.replaceAll('<','&lt;').replaceAll('&','&amp;');;
-}
-
-function toggle_debug()
-{
-    show_debugging_info = !show_debugging_info;
-    var x = document.getElementById("debugdiv");
-    if (x) x.innerHTML = '';
-    var x = document.getElementById("debug_button");
-    if (x) x.style.fontWeight=(show_debugging_info ? 'bold' : 'normal');
-}
-
-function is_array(input){
-    return typeof(input)=='object'&&(input instanceof Array);
+    return this.replaceAll('&','&amp;').replaceAll('<','&lt;');
 }
 
 /*
@@ -53,6 +40,25 @@ function is_array(input){
  a javascript vt100 (or thereabouts) terminal emulation,
  mainly meant for replaying nethack TTYRECs.
 */
+
+/* Fields copied by naoterm.copy()/copyFrom() to snapshot+restore emulator state
+   for frame caching and seeking. Single source of truth so the save and restore
+   lists can't drift -- a field present in one but not the other silently
+   corrupts seeks (this is why last_printed_char and utf8_pending must be here). */
+const NAOTERM_SNAPSHOT_FIELDS = ["SCREEN_WID", "SCREEN_HEI", "hidden_cursor",
+                      "cursor_x", "cursor_y", "saved_cursor_x", "saved_cursor_y",
+                      "saved_attr", "saved_color", "saved_bgcolor", "attr", "color",
+                      "bgcolor", "def_color", "def_bgcolor", "hi_x", "hi_y",
+                      "use_alt_charset", "had_clrscr", "utf8", "utf8_pending",
+                      "last_printed_char"];
+
+/* naoterm cell .attr bitfield (set in setattr(), read in getcellstyle()) */
+const ATTR_BOLD = 1, ATTR_DIM = 2, ATTR_UNDERLINE = 4, ATTR_BLINK = 8,
+      ATTR_REVERSE = 16, ATTR_HIDDEN = 32, ATTR_ITALIC = 64, ATTR_STRIKE = 128;
+
+/* 16-color palette names for the NetHackWiki ({{color|...}}) render path */
+const NAOTERM_COLORNAMES = ["black", "red", "green", "brown", "blue", "magenta", "cyan", "lightgray",
+                            "darkgray", "orange", "brightgreen", "yellow", "brightblue", "brightmagenta", "brightcyan", "white"];
 
 function naoterm(params)
 {
@@ -164,6 +170,11 @@ function naoterm(params)
 
     }
 
+    /* SECURITY INVARIANT: get_html()/getcellspan() coalesce stored cell chars
+       straight into innerHTML (see trd.js), so ttyrec content is only safe
+       because every printable char is escaped here before being stored in
+       putchar(). '<' and '&' MUST stay escaped; do not bypass this map when
+       storing a cell char, or crafted ttyrecs become XSS. */
     this.replacechars = {
         '<': '&lt;',
         '&': '&amp;',
@@ -281,9 +292,12 @@ function naoterm(params)
         for (var i = this.cursor_x; i < this.SCREEN_WID; i++) {
             if (i + numchars < this.SCREEN_WID) {
                 var tmp = this.get_data(i + numchars, this.cursor_y);
-                this.set_data(i, this.cursor_y);
+                if (tmp != undefined)
+                    this.set_data(i, this.cursor_y, tmp);
+                else
+                    this.clrcell(i, this.cursor_y);
             } else {
-                this.clrcell(i + numchars, this.cursor_y);
+                this.clrcell(i, this.cursor_y);
             }
         }
         debugwrite("delete_chars("+numchars+")");
@@ -294,10 +308,15 @@ function naoterm(params)
         if (numchars < 0)
             numchars = 1;
 
-        for (var x = this.SCREEN_WID - 1; x >= this.cursor_x; x--) {
-            var tmp = this.get_data(x, this.cursor_y);
-            this.set_data(x + 1, this.cursor_y, tmp);
+        for (var x = this.SCREEN_WID - 1; x >= this.cursor_x + numchars; x--) {
+            var tmp = this.get_data(x - numchars, this.cursor_y);
+            if (tmp != undefined)
+                this.set_data(x, this.cursor_y, tmp);
+            else
+                this.clrcell(x, this.cursor_y);
         }
+        for (var x = this.cursor_x; x < this.cursor_x + numchars && x < this.SCREEN_WID; x++)
+            this.clrcell(x, this.cursor_y);
         debugwrite("insert_blanks("+numchars+")");
     }
 
@@ -371,61 +390,39 @@ function naoterm(params)
 	  debugwrite("clearup()");
       }
 
-  this.get_str = function(x,y,len)
+  this.render_screen = function(spanfn, rowwrap, rowsep)
       {
-	  var strret = '';
-	  for (i = 0; i < len; i++) {
-	      var cell = this.get_data(x+i, y);
-	      if (cell != undefined && cell['char'] != undefined) {
-		  var c = cell['char'];
-		  if (x >= ' ' && c <= '~') strret += c;
-		  else strret += ' ';
-	      } else strret += ' ';
+	  var maxx = this.hi_x;
+	  var maxy = this.hi_y;
+
+	  var sret = "<div class='ttyscreen'>";
+	  for (var y = 0; y < maxy; y++) {
+	      var row = '';
+	      var x = 0;
+	      while (x < maxx) {
+		  var dat = spanfn.call(this, x, y, maxx);
+		  row += dat['span'];
+		  x = parseInt(dat.x);
+	      }
+	      if (y > 0) sret += rowsep;
+	      sret += rowwrap(row);
 	  }
-	  return strret;
+	  sret += "</div>";
+	  return sret;
       }
 
   this.get_html = function()
       {
-	  var maxx = this.hi_x;
-	  var maxy = this.hi_y;
-
-	  var sret = "<div class='ttyscreen'>";
-	  var y = 0;
-	  while (y < maxy) {
-	      var x = 0;
-              sret += "<span class='ttyrow'>";
-	      while (x < maxx) {
-		  var dat = this.getcellspan(x,y, maxx);
-		  sret += dat['span'];
-		  x = parseInt(dat.x);
-	      }
-	      sret += "</span>";
-	      y++;
-	  }
-	  sret += "</div>";
-	  return sret;
+	  return this.render_screen(this.getcellspan,
+				    function(row) { return "<span class='ttyrow'>"+row+"</span>"; },
+				    "");
       }
 
   this.get_wiki = function()
       {
-	  var maxx = this.hi_x;
-	  var maxy = this.hi_y;
-
-	  var sret = "<div class='ttyscreen'>";
-	  var y = 0;
-	  while (y < maxy) {
-	      var x = 0;
-	      while (x < maxx) {
-		  var dat = this.getcellspan_wiki(x,y, maxx);
-		  sret += dat['span'];
-		  x = parseInt(dat.x);
-	      }
-	      y++;
-	      if (y < maxy) sret += "<br>\n";
-	  }
-	  sret += "</div>";
-	  return sret;
+	  return this.render_screen(this.getcellspan_wiki,
+				    function(row) { return row; },
+				    "<br>\n");
       }
 
   this.clrcell = function(x,y)
@@ -448,11 +445,7 @@ function naoterm(params)
     this.copy = function()
     {
         var ret = {};
-        var fields = ["SCREEN_WID", "SCREEN_HEI", "prevdata", "hidden_cursor",
-                      "cursor_x", "cursor_y", "saved_cursor_x", "saved_cursor_y",
-                      "saved_attr", "saved_color", "saved_bgcolor", "attr", "color",
-                      "bgcolor", "def_color", "def_bgcolor", "hi_x", "hi_y",
-                      "use_alt_charset", "had_clrscr", "utf8", "utf8_pending" ];
+        var fields = NAOTERM_SNAPSHOT_FIELDS;
 
         for (var i = 0; i < fields.length; i++) {
             ret[fields[i]] = this[fields[i]];
@@ -469,11 +462,7 @@ function naoterm(params)
 
     this.copyFrom = function(data)
     {
-        var fields = ["SCREEN_WID", "SCREEN_HEI", "prevdata", "hidden_cursor",
-                      "cursor_x", "cursor_y", "saved_cursor_x", "saved_cursor_y",
-                      "saved_attr", "saved_color", "saved_bgcolor", "attr", "color",
-                      "bgcolor", "def_color", "def_bgcolor", "hi_x", "hi_y",
-                      "use_alt_charset", "had_clrscr", "utf8", "utf8_pending" ];
+        var fields = NAOTERM_SNAPSHOT_FIELDS;
 
         for (var i = 0; i < fields.length; i++) {
             this[fields[i]] = data[fields[i]];
@@ -558,8 +547,9 @@ function naoterm(params)
 	      this.movecursorpos(0, 1);
 	  } else if (o == 9) {
               debugwrite("putchar(TAB)");
-              this.movecursorpos(1, 0);
-              this.movecursorpos((this.cursor_x % 9), 0);
+              var next = (this.cursor_x - (this.cursor_x % 8)) + 8; /* next 8-col tab stop */
+              if (next > this.SCREEN_WID - 1) next = this.SCREEN_WID - 1;
+              this.setcursorpos(next, this.cursor_y);
 	  } else if (o == 8) {
               debugwrite("putchar(BACKSPACE)");
 	      if (this.cursor_x > 0) this.movecursorpos(-1, 0);
@@ -704,8 +694,8 @@ function naoterm(params)
             if (this.colordefs[n] != undefined) {
                 if (is_bg) this.bgcolor = n; else this.color = n;
             } else if (n >= 0 && n <= 15) {
-                if (is_bg) { this.bgcolor = n % 8; if (n >= 8) this.attr |= 1; }
-                else { this.color = n % 8; if (n >= 8) this.attr |= 1; else this.attr &= ~1; }
+                if (is_bg) { this.bgcolor = n % 8; if (n >= 8) this.attr |= ATTR_BOLD; }
+                else { this.color = n % 8; if (n >= 8) this.attr |= ATTR_BOLD; else this.attr &= ~ATTR_BOLD; }
             } else {
                 return 0;
             }
@@ -731,14 +721,14 @@ function naoterm(params)
                   this.attr = 0; this.color = this.def_color; this.bgcolor = this.def_bgcolor;
               } else if ((a >= 0) && (a <= 11)) {
                   switch (a) {
-                  case 1: this.attr |= 1; break; /* bold */
-		  case 2: this.attr |= 2; break; /* half-bright/dim */
-                  case 3: this.attr |= 64; break; /* italic */
-		  case 4: this.attr |= 4; break; /* underscore/underlined */
-		  case 5: this.attr |= 8; break; /* blink */
-		  case 7: this.attr |= 16; break; /* inverse/reverse video */
-		  case 8: this.attr |= 32; break; /* invisible/hidden */
-                  case 9: this.attr |= 128; break; /* strikethrough/crossed-out chars*/
+                  case 1: this.attr |= ATTR_BOLD; break;
+		  case 2: this.attr |= ATTR_DIM; break;
+                  case 3: this.attr |= ATTR_ITALIC; break;
+		  case 4: this.attr |= ATTR_UNDERLINE; break;
+		  case 5: this.attr |= ATTR_BLINK; break;
+		  case 7: this.attr |= ATTR_REVERSE; break;
+		  case 8: this.attr |= ATTR_HIDDEN; break;
+                  case 9: this.attr |= ATTR_STRIKE; break;
 		  case 10: this.use_alt_charset = 0; break;
 		  case 11: this.use_alt_charset = 2; break;
                   default:
@@ -746,14 +736,14 @@ function naoterm(params)
                   }
 	      } else if ((a >= 20) && (a <= 29)) {
                   switch (a-20) {
-                  case 1: this.attr &= ~1; break; /* bold */
-		  case 2: this.attr &= ~2; break; /* half-bright/dim */
-                  case 3: this.attr &= ~64; break; /* italic */
-		  case 4: this.attr &= ~4; break; /* underscore/underlined */
-		  case 5: this.attr &= ~8; break; /* blink */
-		  case 7: this.attr &= ~16; break; /* inverse/reverse video */
-		  case 8: this.attr &= ~32; break; /* invisible/hidden */
-                  case 9: this.attr &= ~128; break; /* strikethrough/crossed-out chars*/
+                  case 1: this.attr &= ~ATTR_BOLD; break;
+		  case 2: this.attr &= ~ATTR_DIM; break;
+                  case 3: this.attr &= ~ATTR_ITALIC; break;
+		  case 4: this.attr &= ~ATTR_UNDERLINE; break;
+		  case 5: this.attr &= ~ATTR_BLINK; break;
+		  case 7: this.attr &= ~ATTR_REVERSE; break;
+		  case 8: this.attr &= ~ATTR_HIDDEN; break;
+                  case 9: this.attr &= ~ATTR_STRIKE; break;
                   default:
                       unhandled = 1;
                   }
@@ -763,7 +753,7 @@ function naoterm(params)
                   var used = this.handle_sgr_color(false, attr, tmpidx);
                   if (used > 0) tmpidx += used; else unhandled = 1;
               }
-              else if (a == 39) { this.color = this.def_color; this.attr &= ~1; }
+              else if (a == 39) { this.color = this.def_color; this.attr &= ~ATTR_BOLD; }
 	      else if ((a >= 40) && (a <= 47)) this.bgcolor = a-40;
               else if (a == 48) {
                   /* CSI 48;5;n (256-color) or 48;2;r;g;b (24-bit) background */
@@ -785,41 +775,42 @@ function naoterm(params)
 
   this.getcellstyle_wiki = function(x,y)
   {
-      var colornames = new Array("black", "red", "green", "brown", "blue", "magenta", "cyan", "lightgray",
-				 "darkgray", "orange", "brightgreen", "yellow", "brightblue", "brightmagenta", "brightcyan", "white");
       var style = 0;
       var cell = this.get_data(x,y);
       if (cell != undefined) {
-	  style = (cell['color'] + ((cell['attr'] & 1) * 8));
+	  style = (cell['color'] + ((cell['attr'] & ATTR_BOLD) * 8));
 	  if (style < 0 || style > 15) style = 7; /* extended colors: lightgray fallback in wiki */
       }
-      return colornames[style];
+      return NAOTERM_COLORNAMES[style];
   }
 
   this.getcellspan_wiki = function(x,y,maxx)
       {
-	  var prevstyle = this.getcellstyle_wiki(x,y);
-	  var style = prevstyle;
+	  var prevstyle = null;
 	  var chars = '';
-	  var showchars = (prevstyle == '') ? 1 : 0;
-	  while ((x < maxx) && (style == prevstyle)) {
-	      style = this.getcellstyle_wiki(x,y);
-	      if (style == prevstyle) {
-		  var cell = this.get_data(x,y);
-		  x++;
-		  if (cell != undefined && cell['char'] != undefined) {
-		      var c = cell['char'];
-		      if (c == '|') c = '&amp;#124;';
-		      else if (c == '}') c = '&amp;#125;';
-		      else if (c == ' ') c = '&amp;nbsp;';
-		      else if (c == '"') c = '&amp;quot;';
-		      else if (c == '\'') c = '&amp;#39;';
-		      else if (c == '>') c = '&amp;gt;';
-		      else if (c == '<') c = '&amp;lt;';
-		      else if (c == '=') c = '&#61;';
-		      chars += c;
-		  } else chars += '&amp;nbsp;';
+	  var showchars = 1;
+	  while (x < maxx) {
+	      var style = this.getcellstyle_wiki(x,y);
+	      if (prevstyle == null) {
+		  prevstyle = style;
+		  showchars = (prevstyle == '') ? 1 : 0;
+	      } else if (style != prevstyle) {
+		  break;
 	      }
+	      var cell = this.get_data(x,y);
+	      x++;
+	      if (cell != undefined && cell['char'] != undefined) {
+		  var c = cell['char'];
+		  if (c == '|') c = '&amp;#124;';
+		  else if (c == '}') c = '&amp;#125;';
+		  else if (c == ' ') c = '&amp;nbsp;';
+		  else if (c == '"') c = '&amp;quot;';
+		  else if (c == '\'') c = '&amp;#39;';
+		  else if (c == '>') c = '&amp;gt;';
+		  else if (c == '<') c = '&amp;lt;';
+		  else if (c == '=') c = '&#61;';
+		  chars += c;
+	      } else chars += '&amp;nbsp;';
 	  }
 
 	  if (prevstyle && (!showchars)) span = '{{'+prevstyle+'|'+chars+'}}';
@@ -847,14 +838,14 @@ function naoterm(params)
 	      var chr = cell['char'];
 
 	      if (atr != undefined) {
-		  if (atr & 1) bright = 1;
-		  //if (atr & 2) /* dim */;
-		  if (atr & 4) style += ' ul';
-		  if (atr & 8) style += ' bl';
-		  if (atr & 16) { /*reverse = 1;*/ var tmp = bg; bg = fg; fg = tmp; }
-		  //if (atr & 32) /* hidden */;
-                  if (atr & 64) style += ' it'; /* italic */
-                  if (atr & 128) style += ' st'; /* strikethrough */
+		  if (atr & ATTR_BOLD) bright = 1;
+		  //if (atr & ATTR_DIM) /* dim */;
+		  if (atr & ATTR_UNDERLINE) style += ' ul';
+		  if (atr & ATTR_BLINK) style += ' bl';
+		  if (atr & ATTR_REVERSE) { /*reverse = 1;*/ var tmp = bg; bg = fg; fg = tmp; }
+		  //if (atr & ATTR_HIDDEN) /* hidden */;
+                  if (atr & ATTR_ITALIC) style += ' it'; /* italic */
+                  if (atr & ATTR_STRIKE) style += ' st'; /* strikethrough */
 	      }
 	      if (bg != undefined && bg != this.def_bgcolor)
 		  style += ' b'+bg;
@@ -870,20 +861,23 @@ function naoterm(params)
   this.getcellspan = function(x,y,maxx)
       {
 	  //debugwrite("getcellspan("+x+","+y+","+maxx+")");
-	  var prevstyle = this.getcellstyle(x,y);
-	  var style = prevstyle;
+	  var prevstyle = null;
 	  var chars = '';
-	  var showchars = (prevstyle == '') ? 1 : 0;
-	  while ((x < maxx) && (style == prevstyle)) {
-	      style = this.getcellstyle(x,y);
-	      if (style == prevstyle) {
-		  var cell = this.get_data(x,y);
-		  x++;
-		  if (cell != undefined && cell['char'] != undefined) {
-		      if (cell['char'] != ' ') showchars = 0;
-		      chars += cell['char'];
-		  } else chars += ' ';
+	  var showchars = 1;
+	  while (x < maxx) {
+	      var style = this.getcellstyle(x,y);
+	      if (prevstyle == null) {
+		  prevstyle = style;
+		  showchars = (prevstyle == '') ? 1 : 0;
+	      } else if (style != prevstyle) {
+		  break;
 	      }
+	      var cell = this.get_data(x,y);
+	      x++;
+	      if (cell != undefined && cell['char'] != undefined) {
+		  if (cell['char'] != ' ') showchars = 0;
+		  chars += cell['char'];
+	      } else chars += ' ';
 	  }
 
 	  if (prevstyle && (!showchars)) span = '<span class="'+prevstyle+'">'+chars+'</span>';
@@ -1136,6 +1130,8 @@ function naoterm(params)
     /* normalize color definition string to #ffffff */
     this.normalize_colordef = function(colorstr)
     {
+        if (colorstr == undefined)
+            return null;
         /* rgb:(FFFF/FFFF/FFFF); each is 0-0xffff */
         var rgbre = new RegExp("^rgb:([0-9a-fA-F]{4})\/([0-9a-fA-F]{4})\/([0-9a-fA-F]{4})");
 
@@ -1143,16 +1139,18 @@ function naoterm(params)
 
         if (rgbre.test(colorstr)) {
             /* rgb:(FFFF/FFFF/FFFF); each is 0-0xffff; scale them down with 256 */
-            colorstr = colorstr.replace(rgbre, function(match, p1, p2, p3) { return "rgb("+parseInt(parseInt(p1,16)/256)+" "+parseInt(parseInt(p2,16)/256)+" "+parseInt(parseInt(p3,16)/256)+")" });
-        } else {
-            colorstr = colorstr.replace(/^rgb:/, "");
-            colorstr = colorstr.replace(/\//g, "");
-            colorstr = colorstr.replace(/^#/g, "");
-            if (!colorstr.match(/^[0-9a-fA-F]+$/)) {
-                this.unhandled("normalize_colordef '"+colorstr+"'");
-            }
+            return colorstr.replace(rgbre, function(match, p1, p2, p3) { return "rgb("+parseInt(parseInt(p1,16)/256)+" "+parseInt(parseInt(p2,16)/256)+" "+parseInt(parseInt(p3,16)/256)+")" });
         }
-        return colorstr;
+        colorstr = colorstr.replace(/^rgb:/, "");
+        colorstr = colorstr.replace(/\//g, "");
+        colorstr = colorstr.replace(/^#/g, "");
+        /* must be a bare hex color now; anything else is attacker bytes that
+           would be injected verbatim into the live stylesheet, so reject it
+           (return null) rather than passing it through. */
+        if (colorstr.match(/^[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/))
+            return "#" + colorstr;
+        this.unhandled("normalize_colordef '"+colorstr+"'");
+        return null;
     }
 
     this.add_ttyscreen_color_def = function(coloridx)
@@ -1167,6 +1165,8 @@ function naoterm(params)
     this.change_color = function(coloridx, colordef)
     {
         colordef = this.normalize_colordef(colordef);
+        if (colordef == null) /* invalid/attacker color; don't touch the stylesheet */
+            return;
         this.get_css_colordefs();
         this.colordefs[coloridx] = colordef;
 
@@ -1239,6 +1239,13 @@ function naoterm(params)
         var params = param.split(";");
         if (parseInt(params[0]) == 4) { /* change color */
             var coloridx = parseInt(params[1]);
+            /* OSC 4 addresses the 0-255 palette; reject out-of-range indices so a
+               crafted ttyrec can't grow the live stylesheet without bound.
+               (24-bit truecolor uses its own max_truecolors-capped path.) */
+            if (isNaN(coloridx) || coloridx < 0 || coloridx > 255) {
+                this.unhandled("OSC 4 color index "+params[1]);
+                return;
+            }
             var colordef = params[2];
             this.change_color(coloridx, colordef);
         } else {

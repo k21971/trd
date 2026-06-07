@@ -19,7 +19,7 @@ $fname = rawurldecode($_GET['file']);
 if (allowed_files($fname)) {
 
     if (!preg_match($REGEX_EXT, $fname) ||
-        !preg_match("/^[-a-zA-Z0-9:\/\.~_]+$/", $fname))
+        !preg_match("/^[-a-zA-Z0-9:\/\.~_]+\z/", $fname))
         fake_ttyrec("Illegal file name");
 
     $fname = preg_replace('/\.\.+/', '.', $fname);
@@ -36,23 +36,40 @@ if (allowed_files($fname)) {
                 @mkdir($CACHE_PATH);
         }
 
-	$fname_tmp = $CACHE_PATH . "/" . basename($fname_nozip);
+        /* key the cache on the full URL, not just basename(), so two hosts
+           sharing a filename can't collide / poison each other's cache. */
+	$fname_tmp = $CACHE_PATH . "/" . hash('sha256', $fname_nozip) . ".ttyrec";
 
 	if (!file_exists($fname_tmp) ||
             file_exists($fname_tmp) && (filectime($fname_tmp)+$CACHE_TIME < time()
                                         || filesize($fname_tmp) == 0)) {
-            $unpackcmd = "";
-            if (isset($UNPACK_PRG[$compress_ext]))
-                $unpackcmd = " | ".$UNPACK_PRG[$compress_ext];
+            /* resolve + pin the host now (blocks SSRF to internal addresses).
+               Guarded so this also works with older/per-variant config.php that
+               predate ssrf_resolve()/$HEAD_PRG and already gate hosts via an
+               allowed_files() allowlist. */
+            $resolve = "";
+            if (function_exists('ssrf_resolve')) {
+                $resolve = ssrf_resolve($fname);
+                if ($resolve === false)
+                    fake_ttyrec("Illegal host");
+            }
 
-            exec($CURL_PRG . " '" . $fname . "'" . $unpackcmd . " > '" . $fname_tmp . "'");
+            $pipeline = $CURL_PRG . " " . $resolve . " " . escapeshellarg($fname);
+            if (isset($UNPACK_PRG[$compress_ext]))
+                $pipeline .= " | " . $UNPACK_PRG[$compress_ext];
+            if (isset($HEAD_PRG))
+                $pipeline .= " | " . $HEAD_PRG; /* bound the decompressed write */
+
+            exec($pipeline . " > " . escapeshellarg($fname_tmp));
 	}
 
         if (is_readable($fname_tmp)) {
             $fsize = filesize($fname_tmp);
             if ($fsize > $MAX_FILESIZE) {
+                @unlink($fname_tmp);
                 fake_ttyrec("ttyrec too big");
             } else if ($fsize == 0) {
+                @unlink($fname_tmp);
                 fake_ttyrec("No such file");
             } else {
                 dump_ttyrec($fname_tmp);

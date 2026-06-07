@@ -39,37 +39,41 @@ function create_ui()
         console.error("No trd_ui id");
         trd_ui_created = 1;
     }
-    btn.innerHTML += '<div id="trd_ui_controls">';
-    btn.innerHTML += '<div>Playing file <span id="current_ttyrec_link"></span></div>';
-    btn.innerHTML += '<div>';
-    btn.innerHTML += '<span id="btn_first"></span>';
-    btn.innerHTML += '<span id="btn_prev"></span>';
-    btn.innerHTML += '<span id="btn_pause"></span>';
-    btn.innerHTML += '<span id="btn_next"></span>';
-    btn.innerHTML += '<span id="btn_last"></span>';
+    /* build the whole control panel in one string, then assign innerHTML once
+       (repeated `innerHTML +=` re-serializes + re-parses the subtree each time). */
+    var html = '';
+    html += '<div id="trd_ui_controls">';
+    html += '<div>Playing file <span id="current_ttyrec_link"></span></div>';
+    html += '<div>';
+    html += '<span id="btn_first"></span>';
+    html += '<span id="btn_prev"></span>';
+    html += '<span id="btn_pause"></span>';
+    html += '<span id="btn_next"></span>';
+    html += '<span id="btn_last"></span>';
     if (ENABLE_RND_TTYREC) {
-        btn.innerHTML += '<span class="divider"> | </span>';
-        btn.innerHTML += '<span id="btn_rnd_ttyrec"></span>';
+        html += '<span class="divider"> | </span>';
+        html += '<span id="btn_rnd_ttyrec"></span>';
     }
-    btn.innerHTML += '<span class="divider"> | </span>';
-    btn.innerHTML += '<span id="btn_debug"></span>';
-    btn.innerHTML += '<span id="btn_screendata"></span>';
-    btn.innerHTML += '<span id="btn_download"></span>';
-    btn.innerHTML += '<span class="divider"> | </span>';
-    btn.innerHTML += '<span id="speed_slider"></span>';
-    btn.innerHTML += '</div>';
-    btn.innerHTML += '<div id="trd_ui_info">';
-    btn.innerHTML += '<span><b>Frame: </b><span id="frame_display"></span></span>';
-    btn.innerHTML += '<span> <b>Size: </b><span id="termsize_display"></span></span>';
-    btn.innerHTML += '<span> <b>Time: </b><span id="frame_time_display"></span></span>';
-    btn.innerHTML += '<span> <b>Played: </b><span id="frame_playtime_display"></span></span>';
-    btn.innerHTML += '<span> <b>Delay: </b><span id="frame_delay_display"></span></span>';
-    btn.innerHTML += '</div>';
-    btn.innerHTML += '</div>';
-    btn.innerHTML += '<div id="tty_loader_div"></div>';
-    btn.innerHTML += '<div id="ttyscreen_html_div"></div>';
-    btn.innerHTML += '<div id="debugdiv"></div>';
-    btn.innerHTML += '<img id="trd_screenshot_img">';
+    html += '<span class="divider"> | </span>';
+    html += '<span id="btn_debug"></span>';
+    html += '<span id="btn_screendata"></span>';
+    html += '<span id="btn_download"></span>';
+    html += '<span class="divider"> | </span>';
+    html += '<span id="speed_slider"></span>';
+    html += '</div>';
+    html += '<div id="trd_ui_info">';
+    html += '<span><b>Frame: </b><span id="frame_display"></span></span>';
+    html += '<span> <b>Size: </b><span id="termsize_display"></span></span>';
+    html += '<span> <b>Time: </b><span id="frame_time_display"></span></span>';
+    html += '<span> <b>Played: </b><span id="frame_playtime_display"></span></span>';
+    html += '<span> <b>Delay: </b><span id="frame_delay_display"></span></span>';
+    html += '</div>';
+    html += '</div>';
+    html += '<div id="tty_loader_div"></div>';
+    html += '<div id="ttyscreen_html_div"></div>';
+    html += '<div id="debugdiv"></div>';
+    html += '<img id="trd_screenshot_img">';
+    btn.innerHTML = html;
 
     btn = $("speed_slider");
     if (btn) {
@@ -302,7 +306,6 @@ function seek_to_frame(target)
             start--;
 
         if (naoterminal) {
-            delete naoterminal;
             naoterminal = undefined;
         }
         naoterminal = new naoterm(naoterm_params);
@@ -369,7 +372,6 @@ function goto_first_frame()
     toggle_pause_playback(1);
     current_frame = 0;
     if (naoterminal) {
-        delete naoterminal;
         naoterminal = undefined;
     }
     show_current_frame();
@@ -422,18 +424,6 @@ function toggle_debug(state)
         $("debug_button").classList.remove('selected');
     }
     return false;
-}
-
-function set_speed(val)
-{
-    if (s < 0 || (SPEED.min > 0 && s < SPEED.min))
-        return;
-    if (SPEED.max > 0 && s > SPEED.max)
-        return;
-    SPEED.current = s;
-    btn = $("speed_display");
-    if (btn)
-	btn.innerHTML = SPEED.current.toString();
 }
 
 playback_timer_count = 0;
@@ -648,11 +638,18 @@ function parse_ttyrec(data)
        this regex matches either of those: */
     var re_clrscr = /(\033\[2J|\033\[H\033\[J)/;
 
-    while (pos < datalen) {
+    while (pos + 12 <= datalen) { /* need a full 12-byte frame header */
         var framepos = pos;
         var time = data.get_long(pos); pos += 4;
         var time_usec = data.get_long(pos); pos += 4;
         var pagelen = data.get_long(pos); pos += 4;
+        /* get_long uses signed shifts, so a high-bit length byte yields a
+           negative pagelen -> pos would move backward and loop forever. Bail on
+           a bad length, and clamp a truncated final frame, so pos always grows. */
+        if (pagelen < 0)
+            break;
+        if (pagelen > datalen - pos)
+            pagelen = datalen - pos;
         var frame = data.slice(pos, pos + pagelen); pos += pagelen;
 
         var delay = calc_frame_delay(time);
@@ -706,26 +703,22 @@ function loading_ttyrec()
 {
     if (req.readyState == 4) { // Complete
 	if (req.status == 200) { // OK response
-	    if (!naoterminal) {
-		$("tty_loader_div").innerHTML = req.responseText;
-	    } else {
-                reset_frame_delay();
-                delete ttyrec_frames;
-                current_frame = 0;
-                first_cached_frame = -1;
-                last_cached_frame = 0;
-                n_cached_frames = 0;
-                ttyrec_frames = parse_ttyrec(unescape(req.responseText));
-                naoterm_params.utf8 = detect_ttyrec_utf8(ttyrec_frames);
-                naoterminal.utf8 = naoterm_params.utf8;
-                naoterminal.utf8_pending = '';
-                naoterminal.prune_extended_colors();
-                toggle_debug(DEBUG_INFO);
-                toggle_pause_playback(PAUSE_INITIAL);
-                show_current_frame();
-                playback_ttyrec();
-                return;
-	    }
+		    reset_frame_delay();
+		    current_frame = 0;
+		    first_cached_frame = -1;
+		    last_cached_frame = -1;
+		    n_cached_frames = 0;
+		    ttyrec_frames = parse_ttyrec(unescape(req.responseText));
+		    naoterm_params.utf8 = detect_ttyrec_utf8(ttyrec_frames);
+		    naoterminal.utf8 = naoterm_params.utf8;
+		    naoterminal.utf8_pending = '';
+		    naoterminal.last_printed_char = '';
+		    naoterminal.prune_extended_colors();
+		    toggle_debug(DEBUG_INFO);
+		    toggle_pause_playback(PAUSE_INITIAL);
+		    show_current_frame();
+		    playback_ttyrec();
+		    return;
 	} else {
 	    toggle_pause_playback(1);
 	    alert("Error: " + req.statusText);
@@ -753,8 +746,14 @@ function ajax_load_ttyrec(ttyrec)
 
     var btn = $("current_ttyrec_link");
     if (btn) {
-        current_ttyrec = current_ttyrec.replaceAll('<','&lt;').replaceAll('&','&amp;');
-        btn.innerHTML = "<a href='"+current_ttyrec+"'>"+current_ttyrec+"</a>";
+        /* build via DOM so the (attacker-controlled) name can't break out of the
+           attribute to inject markup/event handlers; only set href for http(s)
+           so a "javascript:" name can't run on click. */
+        var a = document.createElement("a");
+        a.textContent = current_ttyrec;
+        if (/^https?:\/\//i.test(current_ttyrec))
+            a.setAttribute("href", current_ttyrec);
+        btn.replaceChildren(a);
     }
 
     if (window.XMLHttpRequest) { // Non-IE browsers
@@ -814,9 +813,7 @@ function loading_random_ttyrec()
             first_cached_frame = -1;
             last_cached_frame = -1;
             n_cached_frames = 0;
-            delete ttyrec_frames;
             reset_frame_delay();
-	    delete naoterminal;
 	    naoterminal = new naoterm(naoterm_params);
 	    toggle_pause_playback(1);
             var fname = req.responseText.trim();
