@@ -90,6 +90,37 @@ button.selected {
 .ttyscreen .b14 { background-color: var(--color14); }
 .ttyscreen .b15 { background-color: var(--color15); }
 
+/* "jump to frame" entry box: match the dark form-input look the site theme
+   (altorg.css) gives its text inputs -- near-black fill, dark-red border,
+   light text -- so the number box doesn't render as a stark white default
+   control on the black page. Width is set inline in trd.js. Appended at the
+   end of the file so it never shifts the :root / .fN / .bN rules that
+   naoterm.js rewrites at runtime. */
+#goto_frame_input {
+    background-color: #050505;
+    color: #ffffff;
+    border: 1px solid #440000;
+    /* render the native up/down number-spinner in dark mode (light arrows on
+       the dark box) instead of the browser's default light chrome. The native
+       arrow glyphs can't be recolored directly, so color-scheme is the way to
+       make them fit a dark control. */
+    color-scheme: dark;
+    font-family: monospace;
+    padding: 2px 4px;
+    margin: 0 2px;
+    vertical-align: middle;
+}
+#goto_frame_input:focus {
+    outline: none;
+    border-color: #aa0000;
+}
+/* keep the spinner visible (don't fade it in only on hover) so it reads as a
+   deliberate, themed control; color-scheme above handles its coloring. */
+#goto_frame_input::-webkit-inner-spin-button,
+#goto_frame_input::-webkit-outer-spin-button {
+    opacity: 1;
+}
+
 #helpkey {
     float: right;
 }

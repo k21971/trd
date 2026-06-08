@@ -50,6 +50,8 @@ function create_ui()
     html += '<span id="btn_pause"></span>';
     html += '<span id="btn_next"></span>';
     html += '<span id="btn_last"></span>';
+    html += '<span class="divider"> | </span>';
+    html += '<span id="btn_goto"></span>';
     if (ENABLE_RND_TTYREC) {
         html += '<span class="divider"> | </span>';
         html += '<span id="btn_rnd_ttyrec"></span>';
@@ -108,6 +110,11 @@ function create_ui()
         btn.innerHTML = '<button type="button" onclick="toggle_pause_playback();" id="pause_button">&#x23f8;</button>';
     }
 
+    btn = $("btn_goto"); /* jump straight to a given frame number */
+    if (btn) {
+        btn.innerHTML = '<input type="number" id="goto_frame_input" min="0" style="width:5em;" title="Jump to frame number" placeholder="frame #" onkeydown="if (event.key === \'Enter\') { event.preventDefault(); goto_frame_from_input(); }"><button type="button" onclick="goto_frame_from_input();" id="goto_button">go</button>';
+    }
+
     btn = $("btn_debug");
     if (btn) {
         btn.innerHTML = '<button type="button" onclick="toggle_debug();" id="debug_button">debug</button>';
@@ -141,6 +148,14 @@ function handle_keys()
         return;
     }
 
+    /* don't hijack keystrokes meant for a focused control (the frame-number
+       box, the speed slider, ...) -- otherwise typing e.g. a digit or '.'
+       there would fire a playback shortcut. */
+    var tgt = event.target;
+    if (tgt && (tgt.tagName == 'INPUT' || tgt.tagName == 'TEXTAREA' || tgt.tagName == 'SELECT')) {
+        return;
+    }
+
     switch (event.key) {
     case ' ': /* play/pause */
         btn = $('pause_button');
@@ -156,6 +171,13 @@ function handle_keys()
         btn = $('prev_button');
         if (btn)
             btn.click();
+        break;
+    case 'g': /* jump to a specific frame: focus the frame-number box */
+        btn = $('goto_frame_input');
+        if (btn) {
+            btn.focus();
+            btn.select();
+        }
         break;
     case '.': /* toggle speed */
         btn = $('speed_slider_input');
@@ -385,6 +407,23 @@ function goto_last_frame()
        last frame. */
     toggle_pause_playback(1);
     seek_to_frame(ttyrec_frames.length - 1);
+}
+
+/* Jump to the frame number typed into #goto_frame_input. seek_to_frame()
+   clamps out-of-range targets, so we just parse and hand off; on return we
+   write the landed-on frame back into the box so the user sees where a
+   clamped/out-of-range request actually went. */
+function goto_frame_from_input()
+{
+    var inp = $("goto_frame_input");
+    if (!inp || ttyrec_frames.length < 1)
+        return;
+    var n = parseInt(inp.value, 10);
+    if (isNaN(n))
+        return;
+    toggle_pause_playback(1);
+    seek_to_frame(n);
+    inp.value = current_frame;
 }
 
 function toggle_pause_btn()
@@ -709,6 +748,9 @@ function loading_ttyrec()
 		    last_cached_frame = -1;
 		    n_cached_frames = 0;
 		    ttyrec_frames = parse_ttyrec(unescape(req.responseText));
+		    var gotoinp = $("goto_frame_input");
+		    if (gotoinp)
+			gotoinp.max = (ttyrec_frames.length - 1).toString();
 		    naoterm_params.utf8 = detect_ttyrec_utf8(ttyrec_frames);
 		    naoterminal.utf8 = naoterm_params.utf8;
 		    naoterminal.utf8_pending = '';
